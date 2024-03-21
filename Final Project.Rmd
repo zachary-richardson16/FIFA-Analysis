@@ -1,0 +1,672 @@
+---
+title: "Final Paper"
+author: "STOR 320.01 Group 01"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE }
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(GGally)
+library(kableExtra)
+library(readr)
+library(tidyverse)
+library(rvest)
+library(broom)
+library(maps)
+library(mapdata)
+library(plotly)
+library(gridExtra)
+library(ggpubr)
+library(caret)
+library(xgboost)
+
+```
+
+# INTRODUCTION
+
+Welcome to the world of FIFA, the ultimate gaming experience for soccer fans around the world! Developed by EA Sports, FIFA is the iconic video gaming franchise spanning almost 30 years that has allowed players to control and simulate their favorite legendary clubs and countries. While it is primarily a video game, intended for leisure purposes, the developers of the game may have inadvertently spawned a rich dataset that opens up the door for many deep, layered questions that explore different aspects of players, countries, positions and other factors that are important to not only the game of FIFA, but also the sport of soccer.
+
+Working with over 17,000 different players in this dataset is a difficult task and is hard to visualize. This is especially strenuous when there are over 100 different countries represented among these players. The proportion of players that play significant positions (offense, midfield, defense, goalkeepers) by their nationality is an interesting topic to explore, largely because it allows us to visualize the position groups across the world. Using a map visual, we can display the players in an compelling and practical way by position group which may help useful for scouts when trying to see where the best players by average come from around the world and also may be an applicable tool when making predictions.  
+
+Predicting the player position from the `FIFA 21` dataset is an interesting and worthwhile question because it has practical implications for the world of sports. The ability to accurately predict the position of a player can help teams with scouting, recruitment, and team management decisions. Teams can use this model to identify players who have the potential to perform well in specific positions and optimize their lineup to increase their chances of winning. Additionally, this model can be used by fantasy sports enthusiasts to select players for their teams, which can increase the popularity of fantasy sports games and enhance the entertainment value of sports.
+
+The `FIFA 21` dataset is a rich and comprehensive collection of data on professional football players, and building a model to predict player positions will require exploratory analysis, data cleaning, and feature engineering. The dataset includes variables such as player attributes, team attributes, match details, and player ratings, among others, which makes it a complex and challenging task to analyze. However, this complexity also presents an exciting opportunity to use advanced machine learning techniques to uncover hidden relationships between variables and make accurate predictions.
+
+
+# DATA
+
+The dataset used for this analysis is the Fifa 21 complete player dataset, which was obtained from Kaggle.com. The dataset was compiled by a Kaggle user named Ekrem Bayar, who collected the data via web scraping from sofifa.com. The dataset contains information on 17,125 soccer players, including their personal information, playing positions, skill ratings, and performance statistics.
+
+We decided to exclude secondary positions from our model to predict the player's primary position for several reasons. First, including secondary positions could potentially introduce noise and ambiguity in the data, leading to less accurate predictions. Second, focusing on primary positions alone could simplify the model and make it more interpretable, allowing us to better capture the unique skills and attributes associated with that position. Third, including secondary positions would increase the complexity of the data, which could make it more difficult to train and optimize the model. By removing secondary positions, we could ensure that our model is trained on a cleaner and more focused dataset, which can lead to better performance and more meaningful insights.
+
+
+```{r, message=FALSE, warning=FALSE}
+
+fifaDS <- read_csv(file="fifa21_male2.csv")
+FIFA.FINAL <- fifaDS %>% 
+  select(-c('Player Photo','Flag Photo','Club Logo','Team & Contract','Joined','Loan Date End','Name','IR','Release Clause', 'Contract','Position'))%>%
+  select(-('LS':'Gender'))%>%
+  separate(Height, into = c("ft","inch"), convert = TRUE)%>%
+  mutate(Height = ft*30.48 + inch*2.54, ft=NULL, inch=NULL)%>%
+  mutate(Weight = as.numeric(str_replace(Weight, "lbs", "")))%>%
+  mutate(`W/F` = as.numeric(str_replace(`W/F`," ★","")))%>%
+  mutate(`SM` = as.numeric(str_replace(`SM`,"★","")))%>%
+  mutate(Hits = as.numeric(Hits))
+
+
+# try making value and wage into numeric at a later time
+
+FIFA.FINAL <- FIFA.FINAL %>%
+  mutate(category = case_when(
+    BP %in% c("LWB", "LB", "CB", "RB", "RWB") ~ "Defense",
+    BP %in% c("CDM", "CM", "CAM", "LM", "RM") ~ "Midfield",
+    BP %in% c("CF", "ST", "LW", "RW") ~ "Offense",
+    BP == "GK" ~ "Goalkeeper",
+    TRUE ~ NA_character_
+  )) 
+
+Positions = 
+  select( FIFA.FINAL, -c('Nationality', 'Club', 'foot', 'BP', "Wage", 'Value', 'A/W', 'D/W')) 
+
+
+
+FIFA.FINAL_ratio <- FIFA.FINAL %>%
+  group_by(category, BP) %>%
+  summarize(count = n()) %>%
+  group_by(category) %>%
+  mutate(total_count = sum(count)) %>%
+  mutate(ratio = count / total_count) %>%
+  ungroup() %>%
+  arrange(category, desc(ratio)) %>%
+  group_by(category) %>%
+  mutate(BP = reorder(BP, -ratio))
+
+ggplot(FIFA.FINAL_ratio, aes(x = BP, y = ratio, fill = category)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Ratios of Each Player Position in its Respective Category",
+       x = "Player Position", y = "Ratio") +
+  scale_fill_manual(values = c("#6BAED6", "#C6DBEF", "#FBB4AE", "#FDBF6F"), breaks = c("Defense", "Goalkeeper","Midfield", "Offense"))
+
+
+```
+
+The figure above reveals the ratio of each position within their category and how we chose to group them. The positions are split into the offense, defense, midfield, and goalkeeper categories. The chart differentiates the categories by color. By creating `Category` as a new factor variable we are now able to introduce models that predict a player’s categorical position. This distinction between player `Position` and `Category` is key in providing accurate predictions for the second question. 
+
+Additionally, we decided to remove some identifying variables such as `photos`, `names`, `logos`, and `contracts`. We did this to simplify the data and focus on the performance attributes associated with predictions. Variables such as `Attacking` and `Defending` are heavily weighted while attempting to predict the position of any given player. Using these variables is crucial to finding any sort of pattern between positions and the players within them. We also incorporated physical attributes such as `Height` and `Weight` to find any generalizations of the player’s characteristics within each position. 
+
+```{r, fig.height=7, fig.width=10, message=FALSE, warning=FALSE}
+bp_colors <- c("Defense" = "#6BAED6" , "Midfield" = "#FBB4AE" , "Offense" = "#FDBF6F" )
+def_att_body <- FIFA.FINAL %>%
+  select(Defending, Attacking, Height, Weight, BP) %>%
+  filter(BP != "GK")
+
+def_att_body$Position <- ifelse(def_att_body$BP %in% c("LB", "RB", "CB", "LWB", "RWB"), "Defense",
+            ifelse(def_att_body$BP %in% c("CM", "CDM", "CAM", "LM", "RM"), "Midfield", "Offense"))
+
+def_att_body <- subset(def_att_body, select = -BP)
+
+ggpairs(def_att_body,
+        mapping = aes(color = Position)) +
+  scale_color_manual(values = bp_colors) +
+  scale_fill_manual(values = bp_colors) +
+  labs(title = "Scatterplot Matrix of Defending/Attacking & Body Stats by Position Grouping")
+
+```
+From the `GGally` package, `ggpairs()` allows for robust and comprehensive figures to be created that would otherwise require separate plots. The benefit of our usage of the function here is that it allows us to more intuitively communicate the relationships present between our chosen variables through a pairs plot. The function `ggpairs()` in `GGally` expands upon the alternative of the same name in the `ggplot` package, but it allows for enhanced customization regarding its functionality. Including the correlation values as well as accounting for categorical and numeric variables simultaneously, exemplifies the allure of such a plot generated through this package’s `ggpairs()` function.
+
+The derived `ggpairs()` plot above demonstrates the insights that can be obtained from comparing offensive and defensive player attributes to their position. For example, we are able to come to the general conclusion that players within the forward position typically have higher offensive capabilities as opposed to defensive. This is the opposite for players in the defender position as they typically have greater defensive capabilities. Midfielders differ from the other two positions in how their `Attacking` and `Defending` capabilities are fairly balanced. The difference with midfield players is that they generally fall behind in the physical categories of height and weight. 
+
+```{r}
+world <- map_data("world")
+
+worldthing <- head(world)
+kable(worldthing) %>% kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+To answer our second question regarding predicting a player’s nationality, we incorporated outside geographic data. We obtained all the data from the `world_map` data set in the `maps` package, which is a built-in data library accessible R. . Using this data alongside the `Nationality` variable within the `FIFA 21` data set, we are able to compile all this onto an interactive map. 
+
+# RESULTS
+
+To gain a better understanding of how the distribution of positions by player nationality appears, the proportion of position by player nationality was first determined through the creation of a summary table. The first 10 rows, listed alphabetically, are shown below.
+
+```{r, message=FALSE, warning=FALSE}
+## Change Positions
+Positions <- FIFA.FINAL %>%
+  mutate(category = case_when(
+    BP %in% c("LWB", "LB", "CB", "RB", "RWB") ~ "Defense",
+    BP %in% c("CDM", "CM", "CAM", "LM", "RM") ~ "Midfield",
+    BP %in% c("CF", "ST", "LW", "RW") ~ "Offense",
+    BP == "GK" ~ "Goalkeeper",
+    TRUE ~ NA_character_
+  ))
+
+count <- Positions %>%
+  group_by(Nationality, category) %>%
+  summarize(count=n())
+
+total <- count %>%
+  group_by(Nationality) %>% 
+  summarize(total_count = sum(count))
+
+POSITIONS.FINAL <- left_join(count, total, by = "Nationality") %>%
+  mutate(proportion = count / total_count) %>%
+  select(Nationality, category, proportion) %>%
+  spread(category, proportion)
+
+
+countries_values <- FIFA.FINAL %>% 
+  group_by(Nationality) %>%
+  summarize(n = n()) %>%
+  left_join(POSITIONS.FINAL) %>%
+  mutate(Nationality=ifelse(Nationality=="Bosnia Herzegovina", "Bosnia and Herzegovina", Nationality),
+         Nationality=ifelse(Nationality=="Brunei Darussalam", "Brunei", Nationality),
+         Nationality=ifelse(Nationality=="China PR", "China", Nationality),
+         Nationality=ifelse(Nationality=="Chinese Taipei", "Taiwan", Nationality),
+         Nationality=ifelse(Nationality=="Congo", "Democratic Republic of the Congo", Nationality),
+         Nationality=ifelse(Nationality=="DR Congo", "Democratic Republic of the Congo", Nationality),
+         Nationality=ifelse(Nationality=="Guinea Bissau", "Guinea-Bissau", Nationality),
+         Nationality=ifelse(Nationality=="Korea DPR", "North Korea", Nationality),
+         Nationality=ifelse(Nationality=="Korea Republic", "South Korea", Nationality),
+         Nationality=ifelse(Nationality=="Northern Ireland", "UK", Nationality),
+         Nationality=ifelse(Nationality=="Republic of Ireland", "Ireland", Nationality),
+         Nationality=ifelse(Nationality=="São Tomé &amp; Príncipe", "Sao Tome and Principe", Nationality),
+         Nationality=ifelse(Nationality=="Scotland", "UK", Nationality),
+         Nationality=ifelse(Nationality=="Wales", "UK", Nationality),
+         Nationality=ifelse(Nationality=="United States", "USA", Nationality),
+         Nationality=ifelse(Nationality=="Antigua &amp; Barbuda", "Antigua and Barbuda", Nationality),
+         Nationality=ifelse(Nationality=="Trinidad &amp; Tobago", "Trinidad and Tobago", Nationality)) %>%
+  rename("Prop.Offense"=Offense, "Prop.Midfield"=Midfield, "Prop.Defense"=Defense, "Prop.Goalkeeper"=Goalkeeper)
+
+countries_values <- countries_values %>%
+  select(Nationality, Prop.Offense, Prop.Midfield, Prop.Defense, Prop.Goalkeeper)
+  
+
+# Replace NA values with 0 because that is the same as having no players of a particular position
+countries_values[is.na(countries_values)] <- 0
+kable(head(countries_values, 10)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+world_map = map_data("world")
+
+## Identify which countries should be highlighted in the map based on which countries are in `FIFA.FINAL`
+highlighted_countries <- world_map[world_map$region %in% countries_values$Nationality, ]
+
+## Merge datasets
+highlighted_countries2 <- highlighted_countries %>%
+  left_join(countries_values, by=c("region"="Nationality"))
+
+```
+
+The values shown indicate the proportion of players at each position given a specific nationality.
+This data was then mapped on a world map using the `lat` and `long` variables in the `world_map` data set, which identify each country’s geographic coordinates. A darker shade of red indicates a higher proportion of players playing the specific position in the respective country, while a paler, whiter hue indicates a lower proportion. Countries filled in with gray feature no players in the FIFA 21 data set. 
+
+
+```{r message=FALSE, warning=FALSE}
+MAP.OFFENSE <- ggplot() +
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+               color = "black", fill = "grey80") +
+  geom_polygon(data = highlighted_countries2, aes(x = long, y = lat, group = group, fill = Prop.Offense, text = paste("Country:", region)),
+               color = "black") +
+  scale_fill_gradient(low = "white", high = "red", limits=c(0, 1)) +
+  theme_void() +
+  theme(legend.position = "none") +
+  theme(panel.background = element_rect(fill = "dodgerblue"))
+
+MAP.OFFENSE <- ggplotly(MAP.OFFENSE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+MAP.MIDFIELD <- ggplot() +
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+               color = "black", fill = "grey80") +
+  geom_polygon(data = highlighted_countries2, aes(x = long, y = lat, group = group, fill = Prop.Midfield, text = paste("Country:", region)),
+               color = "black") +
+  scale_fill_gradient(low = "white", high = "red", limits=c(0, 1)) +
+  theme_void() +
+  theme(legend.position = "none") +
+  theme(panel.background = element_rect(fill = "dodgerblue"))
+  
+
+MAP.MIDFIELD <- ggplotly(MAP.MIDFIELD)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+MAP.DEFENSE <- ggplot() +
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+               color = "black", fill = "grey80") +
+  geom_polygon(data = highlighted_countries2, aes(x = long, y = lat, group = group, fill = Prop.Defense, text = paste("Country:", region)),
+               color = "black") +
+  scale_fill_gradient(low = "white", high = "red", limits=c(0, 1)) +
+  theme_void() +
+  theme(legend.position = "none") +
+  theme(panel.background = element_rect(fill = "dodgerblue"))
+
+MAP.DEFENSE <- ggplotly(MAP.DEFENSE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+MAP.GOALIE <- ggplot() +
+  geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+               color = "black", fill = "grey80") +
+  geom_polygon(data = highlighted_countries2, aes(x = long, y = lat, group = group, fill = Prop.Goalkeeper, text = paste("Country:", region)),
+               color = "black") +
+  scale_fill_gradient(low = "white", high = "red", limits=c(0, 1)) +
+  theme_void() +
+  theme(panel.background = element_rect(fill = "dodgerblue")) +
+  labs(fill="Proportion")
+
+MAP.GOALIE <- ggplotly(MAP.GOALIE)
+```
+
+```{r , message=FALSE, warning=FALSE}
+grid <- subplot(MAP.OFFENSE, MAP.MIDFIELD, MAP.DEFENSE, MAP.GOALIE, nrows = 2, widths = c(.5, .5))
+
+annotations = list( 
+  list( 
+    x = 0.25,
+    y = .994,
+    text = "Offense",
+    xref = "paper",
+    yref = "paper",
+    xanchor = "center",
+    yanchor = "bottom",
+    showarrow = FALSE
+  ),
+  list( 
+    x = 0.75,
+    y = .994,
+    text = "Midfield",
+    xref = "paper",
+    yref = "paper",
+    xanchor = "center",
+    yanchor = "bottom",
+    showarrow = FALSE
+  ),
+  list( 
+    x = 0.25,
+    y = 0.475,
+    text = "Defense",
+    xref = "paper",
+    yref = "paper",
+    xanchor = "center",
+    yanchor = "bottom",
+    showarrow = FALSE
+  ),
+  list( 
+    x = 0.75,
+    y = 0.475,
+    text = "Goalkeeper",
+    xref = "paper",
+    yref = "paper",
+    xanchor = "center",
+    yanchor = "bottom",
+    showarrow = FALSE
+  )
+)
+
+grid %>% 
+  layout(annotations=annotations)
+```
+
+As seen in the figures above, there is a higher proportion of players who play both `Midfield` and `Defense` as compared to `Offense` and `Goalkeeper`. These figures also indicate which regions produce players of specific positions at a higher rate relative to other regions. This is shown in the `Offense` plot, as we see a higher concentration of offensive players in Africa. The `Goalkeeper` plot also shows a higher proportion of goalkeepers in North America, Europe, and Asia as compared to continents such as South America, Africa, and Australia. 
+
+One caveat to note about the above figures is that the `FIFA 21` data set includes several countries with very few players (< 5). These countries may appear to have relatively high proportions of players for certain positions, so this is important to keep in mind when viewing the figures.
+
+
+In exploring our second question, we created a model using the `FIFA 21` dataset to train an XGBoost model for predicting player positions on the field. XGBoost was chosen because we wanted to explore models outside of class that we have yet to learn. XGBoost seemed to be a good fit for what we wanted to accomplish as it can do classification analysis with high accuracy and it is relatively easy to learn as beginners to machine learning.  
+
+The dataset is first cleaned and prepared, with unnecessary x variable columns removed. XGBoost can only use numerical variables so columns that were classified as characters were removed. There is a way we could have kept these columns by performing hot encoding. However, we felt that this was not worth doing as many of these columns would logically not affect the position of a player. For example, the `Nationality` and `club` a player falls into is independent of player position.  We then chose to categorize the positions into defense, offense, goalkeeper, and midfield because we believed that retaining all 15 original positions as the predicted variable would result in lower prediction accuracy due to the high number of classes involved. We test this by creating a second model later that includes all 15 original classes and comparing their prediction accuracy. 
+
+We convert the numeric values predicted by the XGBoost model into their corresponding categorical labels. The numeric values represent the position categories 0, 1, 2, and 3, which correspond to goalkeeper, defense, midfield, and offense, respectively. By replacing the numeric values with their corresponding categorical labels, the predicted position categories become more interpretable and easier to compare with the actual position categories in the testing dataset. 
+
+We set the seed, then we split the data into training (80% of the data) and testing sets (20% of the data), and the XGBoost model is trained on the training data for 5 rounds. The model is then used to predict player positions for the testing data, and the results are compared to the true positions. The testing accuracy is calculated as the proportion of correct predictions, with a result of 172 False and 3253 True (approximately 95% accurate for this one specific testing and training case). We attempted this same process with more rounds and lower learning rate but the difference in accuracy was minimal so we chose to stick with n = 5 and the base learning rate of .03. 
+
+We then perform a cross-validation of the model using five folds, where the data is split into five subsets, and the model is trained and validated on each subset in turn. The results are stored in a list, and the accuracy of each fold is printed out. The mean accuracy at our set seed was 0.9042. We also tried this same process with ten folds to see if increasing the folds would yield a higher accuracy rate but it was not significantly better and as a result we kept the five fold model. 
+
+We create a confusion matrix with this model from the results of our cross validation, as seen below, to analyze where our predictions are off. Interestingly, our model has an issue where it is mistaking midfield players for goalkeepers. We also see issues where our model is predicting actual offensive players as midfield players and vice versa. This may be due to the fact that while these positions are distinct, the roles of midfielders and forwards can be quite similar in certain formations and tactical systems. For example, attacking midfielders often play just behind the forwards and are expected to contribute to both the attack and defense of the team. Similarly, some forwards (such as false nines) are expected to drop back and play a midfield role at times.
+
+```{r include=FALSE}
+unique(FIFA.FINAL$BP)
+
+# try making value and wage into numeric at a later time
+
+FIFA.FINAL <- FIFA.FINAL %>%
+  mutate(category = case_when(
+    BP %in% c("LWB", "LB", "CB", "RB", "RWB") ~ "Defense",
+    BP %in% c("CDM", "CM", "CAM", "LM", "RM") ~ "Midfield",
+    BP %in% c("CF", "ST", "LW", "RW") ~ "Offense",
+    BP == "GK" ~ "Goalkeeper",
+    TRUE ~ NA_character_
+  )) 
+
+Positions = 
+  select( FIFA.FINAL, -c('Nationality', 'Club', 'foot', 'BP', "Wage", 'Value', 'A/W', 'D/W')) 
+
+dim(Positions)
+```
+
+```{r include=FALSE}
+table(Positions$category)
+Positions$label<- NA
+Positions$label[Positions$category == 'Goalkeeper'] <- 0
+Positions$label[Positions$category == 'Defense'] <- 1
+Positions$label[Positions$category == 'Midfield'] <- 2
+Positions$label[Positions$category == 'Offense'] <- 3
+```
+
+```{r include=FALSE}
+training <- Positions[sample(rownames(Positions), 13700),]
+testing <- Positions[!rownames(Positions) %in% rownames(training), ]
+```
+
+```{r include=FALSE}
+str(training)
+training_input <- xgb.DMatrix(data = as.matrix(training[,1:60]), label = training$label)
+testing_input <-  xgb.DMatrix(data = as.matrix(testing[,1:60]), label = testing$label)
+```
+
+```{r, include = FALSE}
+xgb_model <- xgb.train(data = training_input, 
+                       nrounds = 5, 
+                       num_class = 4)
+```
+
+```{r, include=FALSE}
+testing$predicted <- predict(xgb_model, testing_input)
+```
+
+```{r, include=FALSE}
+testing$predicted[testing$predicted == 0] <- 'Goalkeeper'
+testing$predicted[testing$predicted == 1] <- 'Defense'
+testing$predicted[testing$predicted == 2] <- 'Midfield'
+testing$predicted[testing$predicted == 3] <- 'Offense'
+```
+
+```{r, include=FALSE}
+testing$label[testing$label == 0] <- 'Goalkeeper'
+testing$label[testing$label == 1] <- 'Defense'
+testing$label[testing$label == 2] <- 'Midfield'
+testing$label[testing$label == 3] <- 'Offense'
+```
+
+```{r, include=FALSE}
+testing$check <- testing$category == testing$predicted
+summary(testing$check)
+
+```
+
+
+```{r, include=FALSE}
+set.seed(123)
+
+training <- Positions[sample(rownames(Positions), 13700),]
+testing <- Positions[!rownames(Positions) %in% rownames(training), ]
+
+# specify the number of folds
+num_folds <- 5
+
+# create the folds
+folds <- createFolds(training$label, k = num_folds)
+
+# set up a list to store the results
+results <- list()
+
+# perform the cross-validation
+for (i in 1:num_folds) {
+  
+  # extract the training and validation data for this fold
+  train_data <- training[-folds[[i]], ]
+  valid_data <- training[folds[[i]], ]
+  
+  # convert the data to the DMatrix format used by xgboost
+  train_dmatrix <- xgb.DMatrix(data = as.matrix(train_data[, 1:60]), label = train_data$label)
+  valid_dmatrix <- xgb.DMatrix(data = as.matrix(valid_data[, 1:60]), label = valid_data$label)
+  
+  # train the model
+  xgb_model <- xgb.train(data = train_dmatrix, 
+                         nrounds = 5, 
+                         num_class = 4)
+  
+  # make predictions on the validation data
+  valid_data$predicted <- predict(xgb_model, valid_dmatrix)
+  
+  # convert the predicted labels to category names
+  valid_data$predicted[valid_data$predicted == 0] <- 'Goalkeeper'
+  valid_data$predicted[valid_data$predicted == 1] <- 'Defense'
+  valid_data$predicted[valid_data$predicted == 2] <- 'Midfield'
+  valid_data$predicted[valid_data$predicted == 3] <- 'Offense'
+  
+  # calculate the accuracy of the predictions
+  valid_data$check <- valid_data$category == valid_data$predicted
+  accuracy <- sum(valid_data$check) / nrow(valid_data)
+  
+  # store the results
+  results[[i]] <- accuracy
+}
+
+# calculate the average accuracy across all folds
+mean_accuracy <- mean(unlist(results))
+
+# print the average accuracy
+print(paste("Mean accuracy:", round(mean_accuracy, 4)))
+```
+
+ 
+```{r, message=FALSE}
+conf_mat.2 <- table( valid_data$category, valid_data$predicted)
+
+rownames(conf_mat.2) <- c("Predicted Goalkeeper", "Predicted Defense", "Predicted Midfield", "Predicted Offense")
+colnames(conf_mat.2) <- c("Actual Goalkeeper", "Actual Defense", "Actual Midfield", "Actual Offense")
+
+kable(conf_mat.2, caption = "Confusion Matrix for Catagroy Model Predictions ")
+```
+
+
+
+For our second model using XGBoost we do the exact same process except now we use all 15 original classes. Our predictions from our model created using the training data on the testing data was 658 false and 2767 true (approximately 76.22% accurate for this one specific testing and training case). The mean accuracy of the cross-validation model using five folds was 0.69. 
+
+We create a confusion matrix with this second model as well. While this matrix is difficult to read due the the number of positions we used in this model, it tells us some interesting insights into where our model is mispredicting. It is evident that our model is having a difficult time distinguishing between positions that share the same responsibilities but do it on distinct sides of the field. For example, we see this problem with our right back and left back. The model also has issues in general with mispredicting non-distinct positions. By non distinct we mean positions that are similar to other positions. For example, "LWB", "LB", "CB", "RB", "RWB" are all defensive positions. However, the model does exceptionally well at more distinct positions such as goalkeeper and striker. 
+
+
+  
+```{r message=FALSE, warning=FALSE, include=FALSE}
+FIFA.FINAL.2 <-  fifaDS %>% 
+  select(-c('Player Photo','Flag Photo','Club Logo','Team & Contract','Joined','Loan Date End','Name','IR','Release Clause', 'Contract','Position'))%>%
+  select(-('LS':'Gender'))%>%
+  separate(Height, into = c("ft","inch"), convert = TRUE)%>%
+  mutate(Height = ft*30.48 + inch*2.54, ft=NULL, inch=NULL)%>%
+  mutate(Weight = as.numeric(str_replace(Weight, "lbs", "")))%>%
+  mutate(`W/F` = as.numeric(str_replace(`W/F`," ★","")))%>%
+  mutate(`SM` = as.numeric(str_replace(`SM`,"★","")))%>%
+  mutate(Hits = as.numeric(Hits))
+
+Positions.2 = FIFA.FINAL.2 %>%
+  select(-'BP', everything(), 'BP') %>%
+  select( -c('Nationality', 'Club',  'foot', "Wage", 'Value', 'A/W', 'D/W')) %>%
+  rename('category' = 'BP')
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+table(Positions.2$category)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+set.seed(123)
+Positions.2$label<- NA
+Positions.2$label[Positions.2$category == 'GK'] <- 0
+Positions.2$label[Positions.2$category == 'LWB'] <- 1
+Positions.2$label[Positions.2$category == 'CM'] <- 2
+Positions.2$label[Positions.2$category == 'CAM'] <- 3
+Positions.2$label[Positions.2$category == 'ST'] <- 4
+Positions.2$label[Positions.2$category == 'RW'] <- 5
+Positions.2$label[Positions.2$category == 'CB'] <- 6
+Positions.2$label[Positions.2$category == 'CF'] <- 7
+Positions.2$label[Positions.2$category == 'CDM'] <- 8
+Positions.2$label[Positions.2$category == 'RWB'] <- 9
+Positions.2$label[Positions.2$category == 'LB'] <- 10
+Positions.2$label[Positions.2$category == 'LM'] <- 11
+Positions.2$label[Positions.2$category == 'RM'] <- 12
+Positions.2$label[Positions.2$category == 'RB'] <- 13
+Positions.2$label[Positions.2$category == 'LW'] <- 14
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+training.2 <- Positions.2[sample(rownames(Positions.2), 13700),]
+testing.2 <- Positions.2[!rownames(Positions.2) %in% rownames(training.2), ]
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+training_input.2 <- xgb.DMatrix(data = as.matrix(training.2[,1:60]), label = training.2$label)
+testing_input.2 <-  xgb.DMatrix(data = as.matrix(testing.2[,1:60]), label = testing.2$label)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+xgb_model.2 <- xgb.train(data = training_input.2, 
+                       nrounds = 5, 
+                       num_class = 15)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+testing.2$predicted <- predict(xgb_model.2, testing_input.2)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+  testing.2$predicted[testing.2$predicted == 0] <- 'GK'
+  testing.2$predicted[testing.2$predicted == 1] <- 'LWB'
+  testing.2$predicted[testing.2$predicted == 2] <- 'CM'
+  testing.2$predicted[testing.2$predicted == 3] <- 'CAM'
+  testing.2$predicted[testing.2$predicted == 4] <- 'ST'
+  testing.2$predicted[testing.2$predicted == 5] <- 'RW'
+  testing.2$predicted[testing.2$predicted == 6] <- 'CB'
+  testing.2$predicted[testing.2$predicted == 7] <- 'CF'
+  testing.2$predicted[testing.2$predicted == 8] <- 'CDM'
+  testing.2$predicted[testing.2$predicted == 9] <- 'RWB'
+  testing.2$predicted[testing.2$predicted == 10] <- 'LB'
+  testing.2$predicted[testing.2$predicted == 11] <- 'LM'
+  testing.2$predicted[testing.2$predicted == 12] <- 'RM'
+  testing.2$predicted[testing.2$predicted == 13] <- 'RB'
+  testing.2$predicted[testing.2$predicted == 14] <- 'LW'
+  
+  testing.2$label[testing.2$label == 0] <- 'GK'
+  testing.2$label[testing.2$label == 1] <- 'LWB'
+  testing.2$label[testing.2$label == 2] <- 'CM'
+  testing.2$label[testing.2$label == 3] <- 'CAM'
+  testing.2$label[testing.2$label == 4] <- 'ST'
+  testing.2$label[testing.2$label == 5] <- 'RW'
+  testing.2$label[testing.2$label == 6] <- 'CB'
+  testing.2$label[testing.2$label == 7] <- 'CF'
+  testing.2$label[testing.2$label == 8] <- 'CDM'
+  testing.2$label[testing.2$label == 9] <- 'RWB'
+  testing.2$label[testing.2$label == 10] <- 'LB'
+  testing.2$label[testing.2$label == 11] <- 'LM'
+  testing.2$label[testing.2$label == 12] <- 'RM'
+  testing.2$label[testing.2$label == 13] <- 'RB'
+  testing.2$label[testing.2$label == 14] <-'LW'
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+testing.2$check <- testing.2$category == testing.2$predicted
+summary(testing.2$check)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+set.seed(123)
+library(caret)
+library(xgboost)
+
+# specify the number of folds
+num_folds <- 5
+
+# create the folds
+folds <- createFolds(training.2$label, k = num_folds)
+
+# set up a list to store the results
+results <- list()
+
+# perform the cross-validation
+for (i in 1:num_folds) {
+  
+  # extract the training and validation data for this fold
+  train_data.2 <- training.2[-folds[[i]], ]
+  valid_data.2 <- training.2[folds[[i]], ]
+  
+  # convert the data to the DMatrix format used by xgboost
+  train_dmatrix <- xgb.DMatrix(data = as.matrix(train_data.2[, 1:60]), label = train_data.2$label)
+  valid_dmatrix <- xgb.DMatrix(data = as.matrix(valid_data.2[, 1:60]), label = valid_data.2$label)
+  
+  # train the model
+  xgb_model.3 <- xgb.train(data = train_dmatrix, 
+                         nrounds = 5, 
+                         num_class = 15)
+  
+  # make predictions on the validation data
+  valid_data.2$predicted <- predict(xgb_model.3, valid_dmatrix)
+  
+  # convert the predicted labels to category names
+  valid_data.2$predicted[valid_data.2$predicted == 0] <- 'GK'
+  valid_data.2$predicted[valid_data.2$predicted == 1] <- 'LWB'
+  valid_data.2$predicted[valid_data.2$predicted == 2] <- 'CM'
+  valid_data.2$predicted[valid_data.2$predicted == 3] <- 'CAM'
+  valid_data.2$predicted[valid_data.2$predicted == 4] <- 'ST'
+  valid_data.2$predicted[valid_data.2$predicted == 5] <- 'RW'
+  valid_data.2$predicted[valid_data.2$predicted == 6] <- 'CB'
+  valid_data.2$predicted[valid_data.2$predicted == 7] <- 'CF'
+  valid_data.2$predicted[valid_data.2$predicted == 8] <- 'CDM'
+  valid_data.2$predicted[valid_data.2$predicted == 9] <- 'RWB'
+  valid_data.2$predicted[valid_data.2$predicted == 10] <- 'LB'
+  valid_data.2$predicted[valid_data.2$predicted == 11] <- 'LM'
+  valid_data.2$predicted[valid_data.2$predicted == 12] <- 'RM'
+  valid_data.2$predicted[valid_data.2$predicted == 13] <- 'RB'
+  valid_data.2$predicted[valid_data.2$predicted == 14] <- 'LW'
+  
+  # calculate the accuracy of the predictions
+  valid_data.2$check <- valid_data.2$category == valid_data.2$predicted
+  accuracy <- sum(valid_data.2$check) / nrow(valid_data.2)
+  
+  # store the results
+  results[[i]] <- accuracy
+}
+
+# calculate the average accuracy across all folds
+mean_accuracy <- mean(unlist(results))
+
+# print the average accuracy
+print(paste("Mean accuracy:", round(mean_accuracy, 4)))
+```
+
+```{r, include = FALSE}
+conf_mat.3 <- table( valid_data.2$category, valid_data.2$predicted)
+conf_mat.3
+```
+
+```{r, width = 5, heigh}
+
+# Create the confusion matrix
+conf_mat.3 <- table(valid_data.2$category, valid_data.2$predicted)
+
+# Convert the matrix to a table using kable()
+kable(conf_mat.3, caption = "Confusion Matrix for Position Model Predictions")
+
+```
+
+# CONCLUSION
+In this paper, we attempted to answer two different questions. Our first question looked into how different nationalities could be indicative of what position a player may play. Instead of focusing on all the different positions of players, we separated the types of players into four different categories, those being ‘Offense’, ‘Defense’, ‘Midfield’, and ‘Goalkeeper’. We looked at where most players came from within these different categories. From our findings, we noticed that most players who played the ‘Offense’ position originated mostly from countries in Africa, and players who played the ‘Goalkeeper’ position often came from countries in North America, Europe, and Asia. There is also a higher proportion of players who play ‘Midfield’ and ‘Defense’ positions in comparison to ‘Offense’ and ‘Goalkeeper’ positions. Our second question dealt with determining how stats differ between different categories of players, the same categories as used in the previous question. In our data, we looked at the relationship between different performance and physical attributes within the four categories of players, those being ‘Attacking’, ‘Defending’, ‘Height’, ‘Weight’, and ‘Position’. The relationships between the variety of different stats show us how some positions will tend to be stronger in some areas than others. As stated before, we see that offense-focused players will more often have more offensive capabilities (in this case, a stronger ‘Attacking’ stat), defense players will more often have enhanced defensive capabilities (a stronger ‘Defending’ stat), and midfield players will be defined as an “all-around” type (seem to have intermediary defensive and offensive stats relative to other position groups). 
+
+Through our analysis of predicted positions and distribution by country, users of the FIFA games would now have a better understanding of how statistics influence where an in-game player best fits in a formation. Depending on the given desires of the individual, either the aggregated position group model or the specific position model may be preferred even though they have differing accuracy rates. Our generalized model being more apt at predicting the correct position grouping (~90% accuracy), compared to the exact position in the second model (~69% accuracy), was expected. This is supported by the idea that statistical differences between levels across the formation should be more pronounced than places between the same level. For example, we would view that the player stats of a forward and a defender are normally more dissimilar to the stats of a center- and left/right midfielder. In terms of usage, the information available through our analysis would be useful for those who partake in the manager mode within the game, a mode that simulates management of a club from their financials to the performance of the team. Being able to optimize what position a player is at the greatest strategic advantage, would be to the direct benefit of these players of the game. The ability to do this effectively is critical in making relevant signings and for most efficiently developing in-game players in order to reach their full potential. Those who are to expand upon our models and/or findings will likely need to understand and account for the individualized preferences of FIFA players, in that there is no objectively “correct” way to play the game. As such, deciding whether to uphold more specific or broader predictive models based on player stats will fluctuate depending on the given situation. Those who play casually would of course have different perspectives from those who take the game much more seriously or even compete at the ranked level.
+
+Considering that our analysis only focuses on FIFA 21, a mere slice of available soccer-based data that can be evaluated, it is crucial to highlight areas in which our evaluative methods could be improved. Firstly, implementing techniques such as k-nearest neighbors or logistic regression may seek to enhance our understanding of how our models succeed, and more importantly, how they fall short in order to produce more representative predictions. The extent to which our models can truly be considered accurate will be directly supported through either one or both of these methods. Secondly, since the FIFA games are meant to simulate the actual sport, incorporating applicable year-based real world player stats into our analysis, in tandem with the game data, has the potential to offer additional insights. This can be achieved through web-scraping techniques for information that is readily available online. For example, you could isolate a specific league for the highest performing players, based on desired in-game results, relative to their value. This value could either be their monetary value, or the value assigned to them through alternative settings such as fantasy sports or the vast array of sports betting platforms. Are real world stats truly informing in-game FIFA stats in a manner we would expect? Perhaps you would be able to find the next Mbappe or Haaland by expanding on these analyses to predict certain desired real world or in-game player stats. There are numerous ways to go about analyzing and utilizing the findings produced by this method, but either way, diversifying the contextual origin of our data will increase its relevance and usefulness. Lastly, given that FIFA 21 was the explicit source of our project, it may be beneficial to look back to previous installments of the franchise to account for differences over time. For example, are the players with 5-Star skills from different versions held to the same standard in terms of the skill moves they are capable of? Is what goes into determining a player to be 90+ overall the same on a year to year basis? Joining the data from other years or performing analyses separately may strengthen our findings through this project or could lead to the discovery of trends that occur as the game evolves over time. In any sense, there are a myriad of potential avenues for directions that can be taken beyond our project due to the immense scale and variety of data available, both in the real world and the FIFA franchise.
+
+
+
+
+
+
+
+
+
